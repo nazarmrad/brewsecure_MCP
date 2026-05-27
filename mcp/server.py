@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""BrewSecure MCP Server — calls the BrewSecure REST API over HTTPS."""
+"""BrewSecure MCP Server — FastMCP 3.x, calls BrewSecure REST API over HTTPS."""
 import os
-import uvicorn
 import httpx
+import uvicorn
 from fastmcp import FastMCP
-from starlette.applications import Starlette
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Route, Mount
 
-MCP_SECRET_TOKEN  = os.environ.get("MCP_SECRET_TOKEN", "")
+MCP_SECRET_TOKEN   = os.environ.get("MCP_SECRET_TOKEN", "")
 BREWSECURE_API_URL = os.environ.get("BREWSECURE_API_URL", "").rstrip("/")
 BREWSECURE_API_KEY = os.environ.get("BREWSECURE_API_KEY", "")
 PORT = int(os.environ.get("MCP_PORT", "3002"))
@@ -18,9 +15,18 @@ PORT = int(os.environ.get("MCP_PORT", "3002"))
 mcp = FastMCP("BrewSecure Inventory")
 
 
-# ── HTTP client helper ────────────────────────────────────────────────────────
+# ── Auth ──────────────────────────────────────────────────────────────────────
 
-def _headers():
+def _authed(request: Request) -> bool:
+    if not MCP_SECRET_TOKEN:
+        return True
+    parts = request.headers.get("Authorization", "").split(" ", 1)
+    return len(parts) == 2 and parts[0] == "Bearer" and parts[1] == MCP_SECRET_TOKEN
+
+
+# ── API client ────────────────────────────────────────────────────────────────
+
+def _api_headers():
     h = {"Accept": "application/json"}
     if BREWSECURE_API_KEY:
         h["Authorization"] = f"Bearer {BREWSECURE_API_KEY}"
@@ -29,12 +35,14 @@ def _headers():
 
 async def _get(path: str, params: dict = None):
     async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(f"{BREWSECURE_API_URL}{path}", headers=_headers(), params=params)
+        r = await client.get(
+            f"{BREWSECURE_API_URL}{path}", headers=_api_headers(), params=params
+        )
         r.raise_for_status()
         return r.json()
 
 
-# ── Internal implementations (shared by MCP tools and /call REST endpoint) ────
+# ── Internal tool implementations ─────────────────────────────────────────────
 
 async def _get_all_products():
     products = await _get("/api/products")
@@ -60,10 +68,13 @@ async def _search_products(query: str, category: str = None, in_stock_only: bool
 async def _check_stock(product_ids: list):
     if not product_ids:
         return []
-    return await _get("/api/products/stock", params={"ids": ",".join(str(i) for i in product_ids)})
+    return await _get(
+        "/api/products/stock",
+        params={"ids": ",".join(str(i) for i in product_ids)},
+    )
 
 
-# ── MCP tool registration ─────────────────────────────────────────────────────
+# ── MCP tools ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 async def get_all_products() -> list:
@@ -98,7 +109,7 @@ before recommending a product to confirm it is not sold out."""
     return await _check_stock(product_ids)
 
 
-# ── Ollama function-calling schema (served at /tools for the chat widget) ─────
+# ── Ollama function-calling schema ────────────────────────────────────────────
 
 OLLAMA_TOOLS = [
     {
@@ -191,17 +202,24 @@ TOOL_DISPATCH = {
 }
 
 
-# ── REST handlers (for the Ollama/Express chat widget) ────────────────────────
+# ── REST routes for the Ollama/Express chat widget ────────────────────────────
 
+@mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request):
     return JSONResponse({"status": "ok"})
 
 
+@mcp.custom_route("/tools", methods=["GET"])
 async def list_tools(request: Request):
+    if not _authed(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     return JSONResponse(OLLAMA_TOOLS)
 
 
-async def call_tool(request: Request):
+@mcp.custom_route("/call", methods=["POST"])
+async def call_tool_handler(request: Request):
+    if not _authed(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     try:
         body = await request.json()
         name = body.get("name", "")
@@ -215,37 +233,7 @@ async def call_tool(request: Request):
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
-# ── Bearer auth middleware ────────────────────────────────────────────────────
-
-class BearerAuth(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/health":
-            return await call_next(request)
-        if MCP_SECRET_TOKEN:
-            raw = request.headers.get("Authorization", "")
-            parts = raw.split(" ", 1)
-            if len(parts) != 2 or parts[0] != "Bearer" or parts[1] != MCP_SECRET_TOKEN:
-                return JSONResponse({"error": "Unauthorized"}, status_code=401)
-        return await call_next(request)
-
-
-# ── Compose app ───────────────────────────────────────────────────────────────
-
-try:
-    _mcp_asgi = mcp.http_app()           # FastMCP >= 2.3
-except AttributeError:
-    _mcp_asgi = mcp.streamable_http_app()  # FastMCP 2.0–2.2
-
-app = Starlette(
-    routes=[
-        Route("/health", health),
-        Route("/tools",  list_tools),
-        Route("/call",   call_tool, methods=["POST"]),
-        Mount("/", app=_mcp_asgi),
-    ]
-)
-app.add_middleware(BearerAuth)
-
+# ── Run ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    uvicorn.run(mcp.http_app(), host="0.0.0.0", port=PORT, log_level="info")
