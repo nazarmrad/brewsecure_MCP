@@ -34,7 +34,7 @@ def _api_headers():
 
 
 async def _get(path: str, params: dict = None):
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=10, verify=False) as client:
         r = await client.get(
             f"{BREWSECURE_API_URL}{path}", headers=_api_headers(), params=params
         )
