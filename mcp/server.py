@@ -42,6 +42,17 @@ async def _get(path: str, params: dict = None):
         return r.json()
 
 
+async def _post(path: str, body: dict):
+    async with httpx.AsyncClient(timeout=10, verify=False) as client:
+        r = await client.post(
+            f"{BREWSECURE_API_URL}{path}",
+            headers={**_api_headers(), "Content-Type": "application/json"},
+            json=body,
+        )
+        r.raise_for_status()
+        return r.json()
+
+
 # ── Internal tool implementations ─────────────────────────────────────────────
 
 async def _get_all_products():
@@ -72,6 +83,19 @@ async def _check_stock(product_ids: list):
         "/api/products/stock",
         params={"ids": ",".join(str(i) for i in product_ids)},
     )
+
+
+async def _get_customer_orders(email: str):
+    return await _get("/api/orders/by-email", params={"email": email})
+
+
+async def _place_order(email: str, items: list, payment_method: str, shipping_address: dict = None):
+    return await _post("/api/orders/by-email", {
+        "email": email,
+        "items": items,
+        "paymentMethod": payment_method,
+        "shippingAddress": shipping_address or {},
+    })
 
 
 # ── MCP tools ─────────────────────────────────────────────────────────────────
@@ -107,6 +131,25 @@ async def check_stock(product_ids: list) -> list:
 this when the customer asks if something is available, asks about stock levels, or
 before recommending a product to confirm it is not sold out."""
     return await _check_stock(product_ids)
+
+
+@mcp.tool()
+async def get_customer_orders(email: str) -> dict:
+    """Returns the full order history for a customer by their email address. Use this
+when the customer asks to check their orders, wants to know about a previous purchase,
+asks 'what did I order?', 'can you check my order?', or provides their email and asks
+about their account activity."""
+    return await _get_customer_orders(email)
+
+
+@mcp.tool()
+async def place_order(email: str, items: list, payment_method: str, shipping_address: dict = None) -> dict:
+    """Places a new order for a customer identified by their email address. Use this when
+the customer wants to buy a product and has confirmed their email, the item(s), and payment
+method. Each item must include 'productId' (integer) and 'quantity' (integer); 'size' is
+optional (default 250g). Product prices are always resolved server-side. Ask for a shipping
+address if not provided."""
+    return await _place_order(email, items, payment_method, shipping_address)
 
 
 # ── Ollama function-calling schema ────────────────────────────────────────────
@@ -192,13 +235,67 @@ OLLAMA_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_customer_orders",
+            "description": (
+                "Returns the full order history for a customer by their email address. Use this "
+                "when the customer asks to check their orders, wants to know about a previous "
+                "purchase, asks 'what did I order?', 'can you check my order?', or provides "
+                "their email and asks about their account activity."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "email": {"type": "string", "description": "The customer's email address"},
+                },
+                "required": ["email"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "place_order",
+            "description": (
+                "Places a new order for a customer identified by their email address. Use this "
+                "when the customer wants to buy a product and has confirmed their email, the "
+                "item(s), and payment method. Ask for a shipping address if not provided."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "email": {"type": "string", "description": "The customer's email address"},
+                    "items": {
+                        "type": "array",
+                        "description": "List of items to order",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "productId": {"type": "integer", "description": "Product ID"},
+                                "quantity":  {"type": "integer", "description": "Number of units"},
+                                "size":      {"type": "string",  "description": "Bag size, e.g. 250g"},
+                            },
+                            "required": ["productId", "quantity"],
+                        },
+                    },
+                    "payment_method":   {"type": "string", "description": "Payment method, e.g. PayPal, Credit Card"},
+                    "shipping_address": {"type": "object", "description": "Shipping address (optional)"},
+                },
+                "required": ["email", "items", "payment_method"],
+            },
+        },
+    },
 ]
 
 TOOL_DISPATCH = {
-    "get_all_products":  lambda a: _get_all_products(),
-    "get_product_by_id": lambda a: _get_product_by_id(a["product_id"]),
-    "search_products":   lambda a: _search_products(**a),
-    "check_stock":       lambda a: _check_stock(a["product_ids"]),
+    "get_all_products":    lambda a: _get_all_products(),
+    "get_product_by_id":   lambda a: _get_product_by_id(a["product_id"]),
+    "search_products":     lambda a: _search_products(**a),
+    "check_stock":         lambda a: _check_stock(a["product_ids"]),
+    "get_customer_orders": lambda a: _get_customer_orders(a["email"]),
+    "place_order":         lambda a: _place_order(a["email"], a["items"], a["payment_method"], a.get("shipping_address")),
 }
 
 
